@@ -24,7 +24,7 @@ def main() -> None:
     else:
         (target / "plugin.yaml").write_text(
             "name: lossless_context\n"
-            "version: 0.1.1\n"
+            "version: 0.1.2\n"
             "description: Source-preserving Lossless Context engine and recall tools for Hermes Agent\n"
             "kind: standalone\n"
             "module: lossless_context\n",

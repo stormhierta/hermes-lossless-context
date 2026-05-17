@@ -9,7 +9,7 @@ from typing import Any
 
 from .utils import content_to_text, escape_like_pattern, estimate_tokens, safe_snippet, sanitize_fts_query, stable_hash
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -241,7 +241,17 @@ class LosslessStore:
         r = self.conn.execute("SELECT * FROM summaries WHERE summary_id=?", (summary_id,)).fetchone()
         if not r:
             return None
-        return SummaryRecord(r["summary_id"], int(r["conversation_id"]), r["kind"], int(r["depth"]), r["content"], int(r["token_count"]), r["earliest_seq"], r["latest_seq"], float(r["created_at"]))
+        return SummaryRecord(
+            summary_id=r["summary_id"],
+            conversation_id=int(r["conversation_id"]),
+            kind=r["kind"],
+            depth=int(r["depth"]),
+            content=r["content"],
+            token_count=int(r["token_count"]),
+            earliest_seq=r["earliest_seq"],
+            latest_seq=r["latest_seq"],
+            created_at=float(r["created_at"]),
+        )
 
     def source_messages_for_summary(self, summary_id: str) -> list[MessageRecord]:
         rows = self.conn.execute(

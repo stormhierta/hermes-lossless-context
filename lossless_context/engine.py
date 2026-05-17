@@ -52,7 +52,9 @@ class LosslessContextEngine(ContextEngine):
             candidate = Path(configured_db).expanduser()
             allowed = state_dir.resolve()
             resolved = candidate.resolve()
-            if not (resolved == allowed or allowed in resolved.parents):
+            try:
+                resolved.relative_to(allowed)
+            except ValueError:
                 raise ValueError(f"HERMES_LCM_DB must stay under {allowed}")
             self.db_path = resolved
         else:
@@ -82,6 +84,9 @@ class LosslessContextEngine(ContextEngine):
         self._ensure_conversation(session_id)
         if messages:
             self.store.ingest_messages(self.conversation_id or 0, messages)
+
+    def close(self) -> None:
+        self.store.close()
 
     def on_session_reset(self) -> None:
         self.last_prompt_tokens = self.last_completion_tokens = self.last_total_tokens = 0
@@ -136,8 +141,9 @@ class LosslessContextEngine(ContextEngine):
             if name == "lcm_expand":
                 sid = str(args.get("id", ""))
                 max_messages = max(1, min(int(args.get("maxMessages", 20)), 100))
-                sources = self.store.source_messages_for_summary(sid)[:max_messages]
-                return json.dumps({"summaryId": sid, "messages": [m.__dict__ for m in sources], "truncated": len(sources) >= max_messages}, ensure_ascii=False)
+                all_sources = self.store.source_messages_for_summary(sid)
+                sources = all_sources[:max_messages]
+                return json.dumps({"summaryId": sid, "messages": [m.__dict__ for m in sources], "truncated": len(all_sources) > max_messages}, ensure_ascii=False)
             if name == "lcm_status":
                 return json.dumps(self.get_status(), ensure_ascii=False)
         except Exception as exc:
@@ -170,12 +176,14 @@ class LosslessContextEngine(ContextEngine):
         non_system = [m for m in original if m.get("role") != "system"]
         head = non_system[: self.protect_first_n]
         tail = non_system[-self.protect_last_n :] if self.protect_last_n else []
-        # Include newest summaries as reference material.
+        # Include newest summaries as reference material. These are assistant
+        # reference notes, not system/developer instructions, so historical
+        # content cannot silently become active policy.
         rows = self.store.conn.execute("SELECT content FROM summaries WHERE conversation_id=? ORDER BY created_at DESC LIMIT 8", (conversation_id,)).fetchall()
         summaries = []
         for row in reversed(rows):
             summaries.append({
-                "role": "system",
+                "role": "assistant",
                 "content": SUMMARY_SYSTEM_GUARD + "\n\n<lossless_context_summary>\n" + row["content"] + "\n</lossless_context_summary>",
             })
         return [*system, *head, *summaries, *tail]

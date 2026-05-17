@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows semantic versioning while it remains in 0.x alpha.
 
+## [0.1.2] - 2026-05-17
+
+### Fixed
+
+- Corrected the Hermes package entry-point group from `hermes.plugins` to `hermes_agent.plugins` and pointed it at the plugin module expected by the Hermes loader.
+- Fixed `lcm_describe` summary field mapping so `created_at`, `earliest_seq`, and `latest_seq` are reported correctly.
+- Hardened `HERMES_LCM_DB` path containment validation.
+- Changed injected lossless summary references from `system` to `assistant` messages so historical content is not elevated into active system policy.
+- Fixed `lcm_expand.truncated` so exact-limit expansions are not reported as truncated.
+- Preserved Unicode search terms in FTS query sanitization.
+- Synchronized package `__version__` with project metadata.
+
+### Added
+
+- Regression coverage for summary field mapping, Unicode FTS terms, DB path containment, `lcm_expand` truncation, and non-system summary reference roles.
+
 ## [0.1.1] - 2026-05-17
 
 ### Fixed

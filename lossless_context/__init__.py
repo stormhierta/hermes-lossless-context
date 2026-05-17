@@ -8,4 +8,4 @@ from .engine import LosslessContextEngine
 from .plugin import register
 
 __all__ = ["LosslessContextEngine", "register"]
-__version__ = "0.1.0"
+__version__ = "0.1.2"

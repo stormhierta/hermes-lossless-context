@@ -75,17 +75,17 @@ def safe_snippet(text: str, query: str = "", limit: int = 500) -> str:
 
 def sanitize_fts_query(query: str) -> str:
     # SQLite FTS MATCH is parameter-bound, but its query language still has
-    # operators that can raise or alter query semantics. Keep non-operator word
+    # operators that can raise or alter query semantics. Keep unicode word
     # tokens and quoted phrases only; drop punctuation and FTS boolean operators.
     blocked = {"AND", "OR", "NOT", "NEAR"}
     tokens = []
-    for token in re.findall(r'"[^"]+"|[\w]+', query or ""):
+    for token in re.findall(r'"[^"]+"|[\w]+', query or "", flags=re.UNICODE):
         if token.startswith('"') and token.endswith('"'):
-            words = [w for w in re.findall(r"\w+", token[1:-1]) if w.upper() not in blocked]
+            words = [w for w in re.findall(r"\w+", token[1:-1], flags=re.UNICODE) if w.upper() not in blocked]
             if words:
                 tokens.append('"' + " ".join(words[:8]) + '"')
         else:
-            cleaned = re.sub(r"\W+", "", token)
+            cleaned = "".join(ch for ch in token if ch.isalnum() or ch == "_")
             if cleaned and cleaned.upper() not in blocked:
                 tokens.append(cleaned)
     return " ".join(tokens[:32]) or '""'
