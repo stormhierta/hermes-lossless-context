@@ -76,3 +76,22 @@ def test_plugin_registers_engine_and_tools():
     register(ctx)
     assert ctx.engines and ctx.engines[0].name == "lossless"
     assert {t["name"] for t in ctx.tools} >= {"lcm_grep", "lcm_describe", "lcm_expand", "lcm_status"}
+
+
+def test_user_plugin_shim_contains_manifest():
+    from pathlib import Path
+    import yaml
+
+    manifest_path = Path(__file__).resolve().parents[1] / "plugin_entry" / "plugin.yaml"
+    assert manifest_path.exists()
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["name"] == "lossless_context"
+    assert manifest["module"] == "lossless_context"
+
+
+def test_package_exposes_hermes_plugin_entry_point():
+    import tomllib
+    from pathlib import Path
+
+    pyproject = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+    assert pyproject["project"]["entry-points"]["hermes.plugins"]["lossless_context"] == "lossless_context.plugin:register"

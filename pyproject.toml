@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-lossless-context"
-version = "0.1.0"
+version = "0.1.1"
 description = "Opt-in Lossless Context Management addon for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,6 +19,9 @@ classifiers = [
 [project.optional-dependencies]
 dev = ["pytest>=7", "build>=1"]
 
+[project.entry-points."hermes.plugins"]
+lossless_context = "lossless_context.plugin:register"
+
 [tool.setuptools.packages.find]
 include = ["lossless_context*"]
 
@@ -28,6 +31,7 @@ include-package-data = true
 [tool.setuptools.data-files]
 "share/hermes-lossless-context/skills/lossless-context" = ["skills/lossless-context/SKILL.md"]
 "share/hermes-lossless-context/skills/lossless-context/references" = ["skills/lossless-context/references/architecture.md", "skills/lossless-context/references/tools.md"]
+"share/hermes-lossless-context/plugin_entry" = ["plugin_entry/__init__.py", "plugin_entry/plugin.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

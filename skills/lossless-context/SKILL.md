@@ -1,7 +1,7 @@
 ---
 name: lossless-context
 description: Use Hermes Lossless Context addon tools to search, inspect, and expand source-preserving compressed session history.
-version: 0.1.0
+version: 0.1.1
 author: Hermes Lossless Context contributors
 license: MIT
 metadata:
