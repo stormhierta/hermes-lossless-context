@@ -2,7 +2,7 @@
 
 Opt-in Lossless Context Management addon for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-This package adapts the useful parts of Martian Engineering's `lossless-claw` design for Hermes without patching Hermes core:
+This package provides a reasonable way for Hermes to understand more of its own context after compaction/compression:
 
 - persistent SQLite message store
 - FTS5 search over old session material
