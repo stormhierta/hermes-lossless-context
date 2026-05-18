@@ -236,3 +236,86 @@ def test_engine_supports_concurrent_tool_calls(tmp_path):
         futures = [executor.submit(call_tool) for _ in range(30)]
         for future in futures:
             future.result()
+
+
+def test_passive_tool_engine_singleton_persists(monkeypatch, tmp_path):
+    import lossless_context.plugin as plugin
+
+    from lossless_context import engine as engine_module
+
+    plugin.get_engine().close()
+    monkeypatch.setattr(plugin, "_tool_engine", None)
+    monkeypatch.setattr(engine_module, "default_state_dir", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_LCM_DB", str(tmp_path / "lossless-context.db"))
+
+    first = plugin.get_engine()
+    second = plugin.get_engine()
+
+    assert plugin._tool_engine is first
+    assert second is first
+
+
+def test_lcm_describe_nonexistent_returns_error_json(tmp_path):
+    engine = LosslessContextEngine(db_path=tmp_path / "lcm.db")
+    engine.on_session_start("missing-summary")
+
+    result = json.loads(engine.handle_tool_call("lcm_describe", {"id": "sum_missing"}))
+
+    assert result == {"error": "summary not found: sum_missing"}
+
+
+def test_lcm_status_returns_expected_keys(tmp_path):
+    engine = LosslessContextEngine(db_path=tmp_path / "lcm.db", context_length=1000)
+    engine.on_session_start("status")
+
+    status = json.loads(engine.handle_tool_call("lcm_status", {}))
+
+    assert status["engine"] == "lossless"
+    assert status["db_path"].endswith("lcm.db")
+    assert status["threshold_tokens"] == 750
+    assert status["context_length"] == 1000
+    assert status["compression_count"] == 0
+    assert status["integrity"]["ok"] is True
+    assert isinstance(status["integrity"]["issues"], list)
+
+
+def test_engine_should_compress_preflight_respects_threshold(tmp_path):
+    engine = LosslessContextEngine(db_path=tmp_path / "lcm.db", context_length=100)
+
+    assert engine.should_compress_preflight([{"role": "user", "content": "tiny"}]) is False
+    assert engine.should_compress_preflight([{"role": "user", "content": "word " * 400}]) is True
+
+
+def test_leaf_summary_descendant_count_matches_source_links(tmp_path):
+    store = LosslessStore(tmp_path / "lcm.db")
+    cid = store.get_or_create_conversation("descendants")
+    store.ingest_messages(cid, [{"role": "user", "content": f"source {i}"} for i in range(5)])
+    chunk = store.unsummarized_messages(cid, protect_last_n=0, limit_tokens=1000)
+
+    sid = store.create_leaf_summary(cid, chunk, "descendant summary")
+    row = store.conn.execute(
+        "SELECT descendant_count, (SELECT COUNT(*) FROM message_summaries WHERE summary_id=?) AS link_count "
+        "FROM summaries WHERE summary_id=?",
+        (sid, sid),
+    ).fetchone()
+
+    assert row["descendant_count"] == len(chunk)
+    assert row["link_count"] == len(chunk)
+    assert store.integrity_report()["ok"] is True
+
+
+def test_public_release_metadata_versions_are_consistent():
+    from pathlib import Path
+    import tomllib
+    import yaml
+    import lossless_context
+
+    root = Path(__file__).resolve().parents[1]
+    pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    package_version = pyproject["project"]["version"]
+    plugin_manifest = yaml.safe_load((root / "plugin_entry" / "plugin.yaml").read_text(encoding="utf-8"))
+    skill_text = (root / "skills" / "lossless-context" / "SKILL.md").read_text(encoding="utf-8")
+
+    assert lossless_context.__version__ == package_version
+    assert plugin_manifest["version"] == package_version
+    assert f"version: {package_version}" in skill_text

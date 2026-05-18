@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows semantic versioning while it remains in 0.x alpha.
 
+## [0.1.4] - 2026-05-18
+
+### Fixed
+
+- Synchronized public release metadata across package, user-plugin manifest, bundled skill, and installer fallback manifest.
+- Included `plugin_entry/` in source distributions for manual shim installs from release artifacts.
+- Logged unexpected recall-tool exceptions while keeping user-facing tool errors concise.
+- Tightened `HERMES_LCM_DB` containment checks with resolved path validation.
+
+### Added
+
+- Regression coverage for passive-tool singleton persistence, missing-summary errors, `lcm_status` schema, preflight compression thresholds, summary edge integrity, and package metadata consistency.
+
 ## [0.1.3] - 2026-05-18
 
 ### Fixed

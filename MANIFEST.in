@@ -3,3 +3,4 @@ include LICENSE
 recursive-include skills *.md
 recursive-include scripts *.py
 recursive-include tests *.py
+recursive-include plugin_entry *

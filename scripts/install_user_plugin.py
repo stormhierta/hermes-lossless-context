@@ -4,6 +4,11 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+try:
+    from lossless_context import __version__ as PACKAGE_VERSION
+except Exception:
+    PACKAGE_VERSION = "0.1.4"
+
 
 def hermes_home() -> Path:
     try:
@@ -24,7 +29,7 @@ def main() -> None:
     else:
         (target / "plugin.yaml").write_text(
             "name: lossless_context\n"
-            "version: 0.1.2\n"
+            f"version: {PACKAGE_VERSION}\n"
             "description: Source-preserving Lossless Context engine and recall tools for Hermes Agent\n"
             "kind: standalone\n"
             "module: lossless_context\n",
