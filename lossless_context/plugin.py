@@ -7,14 +7,21 @@ from typing import Any
 
 from .engine import LosslessContextEngine
 
-_engine: LosslessContextEngine | None = None
+_tool_engine: LosslessContextEngine | None = None
 
 
 def get_engine() -> LosslessContextEngine:
-    global _engine
-    if _engine is None:
-        _engine = LosslessContextEngine()
-    return _engine
+    """Return the passive recall-tool engine.
+
+    Active context-engine registrations receive fresh instances in register()
+    so gateway sessions do not share mutable per-session state. The passive
+    tool engine is safe to reuse because LosslessStore uses thread-local SQLite
+    connections.
+    """
+    global _tool_engine
+    if _tool_engine is None:
+        _tool_engine = LosslessContextEngine()
+    return _tool_engine
 
 
 def _requirements_available() -> bool:
@@ -39,10 +46,10 @@ def register(ctx: Any) -> None:
     the plugin is enabled as a normal Hermes plugin. Full engine mode still
     requires `context.engine: lossless`.
     """
-    engine = get_engine()
     if hasattr(ctx, "register_context_engine"):
-        ctx.register_context_engine(engine)
+        ctx.register_context_engine(LosslessContextEngine())
     if hasattr(ctx, "register_tool"):
+        engine = get_engine()
         for schema in engine.get_tool_schemas():
             name = schema["name"]
             ctx.register_tool(

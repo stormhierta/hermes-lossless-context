@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,19 +47,39 @@ class LosslessStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path))
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
+        self._local = threading.local()
+        self._write_lock = threading.RLock()
         self._init_schema()
 
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """Return a SQLite connection owned by the current thread.
+
+        Hermes gateway runs blocking agent work in a thread pool. A context
+        engine instance can therefore be created in one worker and used in
+        another. Python's sqlite3 connections are thread-affine by default, so
+        the store must not keep a single process-wide connection object.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(self.db_path), timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            self._local.conn = conn
+        return conn
+
     def close(self) -> None:
-        self.conn.close()
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
 
     def _init_schema(self) -> None:
-        cur = self.conn.cursor()
-        cur.executescript(
-            """
+        with self._write_lock:
+            cur = self.conn.cursor()
+            cur.executescript(
+                """
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS conversations(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,58 +138,60 @@ class LosslessStore:
         CREATE INDEX IF NOT EXISTS idx_messages_conv_seq ON messages(conversation_id, seq);
         CREATE INDEX IF NOT EXISTS idx_summaries_conv_depth ON summaries(conversation_id, depth, created_at);
         """
-        )
-        try:
-            cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content_text, content='messages', content_rowid='id')")
-            cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS summaries_fts USING fts5(content, content='summaries', content_rowid='rowid')")
-            self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('fts5','1')")
-        except sqlite3.DatabaseError:
-            self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('fts5','0')")
-        self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
-        self.conn.commit()
+            )
+            try:
+                cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content_text, content='messages', content_rowid='id')")
+                cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS summaries_fts USING fts5(content, content='summaries', content_rowid='rowid')")
+                self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('fts5','1')")
+            except sqlite3.DatabaseError:
+                self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('fts5','0')")
+            self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
+            self.conn.commit()
 
     def fts_enabled(self) -> bool:
         row = self.conn.execute("SELECT value FROM meta WHERE key='fts5'").fetchone()
         return bool(row and row[0] == "1")
 
     def get_or_create_conversation(self, session_id: str, session_key: str | None = None, title: str | None = None) -> int:
-        now = time.time()
-        session_key = session_key or session_id or "default"
-        row = self.conn.execute("SELECT id FROM conversations WHERE session_id=?", (session_id,)).fetchone()
-        if row:
-            self.conn.execute("UPDATE conversations SET updated_at=?, title=COALESCE(?, title) WHERE id=?", (now, title, row[0]))
+        with self._write_lock:
+            now = time.time()
+            session_key = session_key or session_id or "default"
+            row = self.conn.execute("SELECT id FROM conversations WHERE session_id=?", (session_id,)).fetchone()
+            if row:
+                self.conn.execute("UPDATE conversations SET updated_at=?, title=COALESCE(?, title) WHERE id=?", (now, title, row[0]))
+                self.conn.commit()
+                return int(row[0])
+            cur = self.conn.execute(
+                "INSERT INTO conversations(session_id, session_key, title, created_at, updated_at) VALUES(?,?,?,?,?)",
+                (session_id, session_key, title, now, now),
+            )
             self.conn.commit()
-            return int(row[0])
-        cur = self.conn.execute(
-            "INSERT INTO conversations(session_id, session_key, title, created_at, updated_at) VALUES(?,?,?,?,?)",
-            (session_id, session_key, title, now, now),
-        )
-        self.conn.commit()
-        return int(cur.lastrowid)
+            return int(cur.lastrowid)
 
     def ingest_messages(self, conversation_id: int, messages: list[dict[str, Any]]) -> int:
         """Idempotently ingest OpenAI-format messages. Returns inserted count."""
-        next_seq = self._next_seq(conversation_id)
-        inserted = 0
-        for idx, msg in enumerate(messages):
-            role = str(msg.get("role") or "unknown")[:40]
-            content_json = json.dumps(msg.get("content"), ensure_ascii=False, sort_keys=True, default=str)
-            text = content_to_text(msg.get("content"), max_chars=200_000)
-            identity = stable_hash(role, content_json)
-            tokens = estimate_tokens(msg.get("content"))
-            try:
-                cur = self.conn.execute(
-                    "INSERT INTO messages(conversation_id, seq, role, content_json, content_text, token_count, identity_hash, created_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (conversation_id, next_seq + idx, role, content_json, text, tokens, identity, time.time()),
-                )
-                mid = int(cur.lastrowid)
-                self._insert_message_fts(mid, text)
-                self._append_context_item(conversation_id, "message", mid, None)
-                inserted += 1
-            except sqlite3.IntegrityError:
-                continue
-        self.conn.commit()
-        return inserted
+        with self._write_lock:
+            next_seq = self._next_seq(conversation_id)
+            inserted = 0
+            for idx, msg in enumerate(messages):
+                role = str(msg.get("role") or "unknown")[:40]
+                content_json = json.dumps(msg.get("content"), ensure_ascii=False, sort_keys=True, default=str)
+                text = content_to_text(msg.get("content"), max_chars=200_000)
+                identity = stable_hash(role, content_json)
+                tokens = estimate_tokens(msg.get("content"))
+                try:
+                    cur = self.conn.execute(
+                        "INSERT INTO messages(conversation_id, seq, role, content_json, content_text, token_count, identity_hash, created_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (conversation_id, next_seq + idx, role, content_json, text, tokens, identity, time.time()),
+                    )
+                    mid = int(cur.lastrowid)
+                    self._insert_message_fts(mid, text)
+                    self._append_context_item(conversation_id, "message", mid, None)
+                    inserted += 1
+                except sqlite3.IntegrityError:
+                    continue
+            self.conn.commit()
+            return inserted
 
     def _insert_message_fts(self, rowid: int, text: str) -> None:
         if self.fts_enabled():
@@ -221,21 +244,22 @@ class LosslessStore:
     def create_leaf_summary(self, conversation_id: int, messages: list[MessageRecord], content: str, model: str | None = None) -> str:
         if not messages:
             raise ValueError("cannot summarize empty message list")
-        sid = "sum_" + stable_hash(conversation_id, messages[0].seq, messages[-1].seq, content)[:16]
-        token_count = estimate_tokens(content)
-        source_tokens = sum(m.token_count for m in messages)
-        self.conn.execute(
-            """INSERT OR IGNORE INTO summaries(summary_id, conversation_id, kind, depth, content, token_count, earliest_seq, latest_seq, descendant_count, source_message_token_count, model, created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (sid, conversation_id, "leaf", 0, content, token_count, messages[0].seq, messages[-1].seq, len(messages), source_tokens, model, time.time()),
-        )
-        rowid = self.conn.execute("SELECT rowid FROM summaries WHERE summary_id=?", (sid,)).fetchone()[0]
-        self._insert_summary_fts(int(rowid), content)
-        for m in messages:
-            self.conn.execute("INSERT OR IGNORE INTO message_summaries(message_id, summary_id) VALUES(?,?)", (m.id, sid))
-        self._append_context_item(conversation_id, "summary", None, sid)
-        self.conn.commit()
-        return sid
+        with self._write_lock:
+            sid = "sum_" + stable_hash(conversation_id, messages[0].seq, messages[-1].seq, content)[:16]
+            token_count = estimate_tokens(content)
+            source_tokens = sum(m.token_count for m in messages)
+            self.conn.execute(
+                """INSERT OR IGNORE INTO summaries(summary_id, conversation_id, kind, depth, content, token_count, earliest_seq, latest_seq, descendant_count, source_message_token_count, model, created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (sid, conversation_id, "leaf", 0, content, token_count, messages[0].seq, messages[-1].seq, len(messages), source_tokens, model, time.time()),
+            )
+            rowid = self.conn.execute("SELECT rowid FROM summaries WHERE summary_id=?", (sid,)).fetchone()[0]
+            self._insert_summary_fts(int(rowid), content)
+            for m in messages:
+                self.conn.execute("INSERT OR IGNORE INTO message_summaries(message_id, summary_id) VALUES(?,?)", (m.id, sid))
+            self._append_context_item(conversation_id, "summary", None, sid)
+            self.conn.commit()
+            return sid
 
     def get_summary(self, summary_id: str) -> SummaryRecord | None:
         r = self.conn.execute("SELECT * FROM summaries WHERE summary_id=?", (summary_id,)).fetchone()
