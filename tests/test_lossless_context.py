@@ -1,4 +1,6 @@
+import concurrent.futures
 import json
+import threading
 
 from lossless_context.engine import LosslessContextEngine
 from lossless_context.store import LosslessStore
@@ -76,6 +78,25 @@ def test_plugin_registers_engine_and_tools():
     register(ctx)
     assert ctx.engines and ctx.engines[0].name == "lossless"
     assert {t["name"] for t in ctx.tools} >= {"lcm_grep", "lcm_describe", "lcm_expand", "lcm_status"}
+
+
+def test_plugin_registers_fresh_context_engine_instances():
+    from lossless_context.plugin import register
+
+    class Ctx:
+        def __init__(self):
+            self.engines = []
+        def register_context_engine(self, engine):
+            self.engines.append(engine)
+        def register_tool(self, **kwargs):
+            pass
+
+    first = Ctx()
+    second = Ctx()
+    register(first)
+    register(second)
+    assert first.engines and second.engines
+    assert first.engines[0] is not second.engines[0]
 
 
 def test_user_plugin_shim_contains_manifest():
@@ -158,3 +179,60 @@ def test_compressed_summary_reference_is_not_system_role(tmp_path):
     reference_msgs = [m for m in out if "lossless_context_summary" in m.get("content", "")]
     assert reference_msgs
     assert all(m["role"] == "assistant" for m in reference_msgs)
+
+
+def test_store_uses_thread_local_sqlite_connections(tmp_path):
+    store = LosslessStore(tmp_path / "lcm.db")
+    main_conn_id = id(store.conn)
+    worker_conn_ids = []
+
+    def touch_store():
+        cid = store.get_or_create_conversation("thread-local")
+        store.ingest_messages(cid, [{"role": "user", "content": "worker thread message"}])
+        worker_conn_ids.append(id(store.conn))
+
+    thread = threading.Thread(target=touch_store)
+    thread.start()
+    thread.join()
+
+    assert worker_conn_ids
+    assert worker_conn_ids[0] != main_conn_id
+
+
+def test_store_supports_concurrent_threadpool_access(tmp_path):
+    store = LosslessStore(tmp_path / "lcm.db")
+    cid = store.get_or_create_conversation("concurrent-store")
+
+    def ingest(i: int):
+        store.ingest_messages(cid, [{"role": "user", "content": f"concurrent message {i}"}])
+
+    def read():
+        store.grep("concurrent", conversation_id=cid)
+        store.unsummarized_messages(cid, protect_last_n=2, limit_tokens=1000)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(ingest, i) for i in range(40)]
+        futures.extend(executor.submit(read) for _ in range(40))
+        for future in futures:
+            future.result()
+
+    assert store.grep("concurrent", conversation_id=cid)
+
+
+def test_engine_supports_concurrent_tool_calls(tmp_path):
+    engine = LosslessContextEngine(db_path=tmp_path / "lcm.db", context_length=200)
+    engine.on_session_start("concurrent-engine")
+    engine.store.ingest_messages(
+        engine.conversation_id or 0,
+        [{"role": "user", "content": f"threaded tool message {i}"} for i in range(10)],
+    )
+
+    def call_tool():
+        result = json.loads(engine.handle_tool_call("lcm_grep", {"pattern": "threaded tool"}))
+        assert "error" not in result
+        assert result["results"]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(call_tool) for _ in range(30)]
+        for future in futures:
+            future.result()

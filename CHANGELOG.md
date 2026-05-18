@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows semantic versioning while it remains in 0.x alpha.
 
+## [0.1.3] - 2026-05-18
+
+### Fixed
+
+- Fixed `sqlite3.ProgrammingError` in Hermes gateway/thread-pool sessions by moving `LosslessStore` to thread-local SQLite connections.
+- Serialized store writes with a re-entrant lock so concurrent gateway/tool access cannot race sequence or context-item allocation.
+- Stopped registering the same mutable `LosslessContextEngine` instance as the active context engine across sessions; passive recall tools still reuse a safe shared engine.
+
+### Added
+
+- Regression coverage for per-thread SQLite connections, concurrent store access, concurrent engine tool calls, and fresh active context-engine registration.
+
 ## [0.1.2] - 2026-05-17
 
 ### Fixed
