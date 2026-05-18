@@ -9,17 +9,37 @@ from typing import Any
 CHARS_PER_TOKEN = 4
 
 
-def estimate_tokens(value: Any) -> int:
+def _text_for_token_estimate(value: Any) -> str:
     if value is None:
-        return 0
+        return ""
     if isinstance(value, str):
-        return max(1, len(value) // CHARS_PER_TOKEN) if value else 0
+        return value
     if isinstance(value, list):
-        return sum(estimate_tokens(v.get("text", v) if isinstance(v, dict) else v) for v in value)
+        return "\n".join(_text_for_token_estimate(v.get("text", v) if isinstance(v, dict) else v) for v in value)
     try:
-        return max(1, len(json.dumps(value, ensure_ascii=False)) // CHARS_PER_TOKEN)
+        return json.dumps(value, ensure_ascii=False)
     except Exception:
-        return max(1, len(str(value)) // CHARS_PER_TOKEN)
+        return str(value)
+
+
+def estimate_tokens(value: Any) -> int:
+    """Estimate model tokens, preferring tiktoken when it is installed.
+
+    The fallback is intentionally conservative for code/non-English-heavy text:
+    it combines a char heuristic with a word/punctuation count instead of using
+    the previous single 4-chars-per-token rule.
+    """
+    text = _text_for_token_estimate(value)
+    if not text:
+        return 0
+    try:
+        import tiktoken  # type: ignore
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    except Exception:
+        wordish = len(re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE))
+        by_chars = max(1, len(text) // CHARS_PER_TOKEN)
+        return max(1, max(wordish, by_chars))
 
 
 def content_to_text(content: Any, *, max_chars: int | None = None) -> str:

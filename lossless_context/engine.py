@@ -19,7 +19,8 @@ except Exception:  # allows tests without Hermes installed
             self.context_length = context_length
             self.threshold_tokens = int(context_length * self.threshold_percent)
 
-from .store import LosslessStore, MessageRecord
+from .store import LosslessStore, MessageRecord, SummaryRecord
+from .summarizers import DeterministicSummarizer, Summarizer
 from .utils import default_state_dir, estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,7 @@ class LosslessContextEngine(ContextEngine):
     protect_first_n = int(os.getenv("HERMES_LCM_PROTECT_FIRST", "3"))
     protect_last_n = int(os.getenv("HERMES_LCM_PROTECT_LAST", "6"))
 
-    def __init__(self, db_path: str | Path | None = None, *, context_length: int = 128000):
+    def __init__(self, db_path: str | Path | None = None, *, context_length: int = 128000, summarizer: Summarizer | None = None):
         self.context_length = int(context_length or 128000)
         self.threshold_tokens = int(self.context_length * self.threshold_percent)
         self.last_prompt_tokens = 0
@@ -63,6 +64,10 @@ class LosslessContextEngine(ContextEngine):
         self.store = LosslessStore(self.db_path)
         self.leaf_chunk_tokens = int(os.getenv("HERMES_LCM_LEAF_CHUNK_TOKENS", "20000"))
         self.min_leaf_messages = int(os.getenv("HERMES_LCM_MIN_LEAF_MESSAGES", "4"))
+        self.parent_summary_fanout = int(os.getenv("HERMES_LCM_PARENT_SUMMARY_FANOUT", "8"))
+        self.max_summary_depth = int(os.getenv("HERMES_LCM_MAX_SUMMARY_DEPTH", "2"))
+        self.summarizer = summarizer or DeterministicSummarizer(max_messages=int(os.getenv("HERMES_LCM_SUMMARY_MAX_MESSAGES", "40")))
+        self.last_assembly: dict[str, Any] = {}
 
     @property
     def name(self) -> str:
@@ -83,6 +88,12 @@ class LosslessContextEngine(ContextEngine):
 
     def on_session_end(self, session_id: str, messages: list[dict[str, Any]]) -> None:
         self._ensure_conversation(session_id)
+        if messages:
+            self.store.ingest_messages(self.conversation_id or 0, messages)
+
+    def on_turn_end(self, messages: list[dict[str, Any]], session_id: str | None = None, **_: Any) -> None:
+        """Passive per-turn indexing hook for Hermes versions that expose one."""
+        self._ensure_conversation(session_id or self.session_id)
         if messages:
             self.store.ingest_messages(self.conversation_id or 0, messages)
 
@@ -111,8 +122,9 @@ class LosslessContextEngine(ContextEngine):
         chunk = self.store.unsummarized_messages(cid, protect_last_n=self.protect_last_n, limit_tokens=self.leaf_chunk_tokens)
         if len(chunk) >= self.min_leaf_messages:
             content = self._summarize_chunk(chunk, focus_topic=focus_topic)
-            self.store.create_leaf_summary(cid, chunk, content, model="deterministic-v0.1")
+            self.store.create_leaf_summary(cid, chunk, content, model=self.summarizer.model_name)
             self.compression_count += 1
+            self._maybe_create_parent_summary(cid, focus_topic=focus_topic)
         return self._assemble_messages(cid, messages)
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
@@ -153,7 +165,7 @@ class LosslessContextEngine(ContextEngine):
         return json.dumps({"error": f"unknown tool: {name}"})
 
     def get_status(self) -> dict[str, Any]:
-        return {"engine": self.name, "db_path": str(self.db_path), "last_prompt_tokens": self.last_prompt_tokens, "threshold_tokens": self.threshold_tokens, "context_length": self.context_length, "compression_count": self.compression_count, "integrity": self.store.integrity_report()}
+        return {"engine": self.name, "db_path": str(self.db_path), "last_prompt_tokens": self.last_prompt_tokens, "threshold_tokens": self.threshold_tokens, "context_length": self.context_length, "compression_count": self.compression_count, "last_assembly": self.last_assembly, "integrity": self.store.integrity_report()}
 
     def _ensure_conversation(self, session_id: str | None) -> None:
         if self.conversation_id is None:
@@ -161,31 +173,76 @@ class LosslessContextEngine(ContextEngine):
             self.conversation_id = self.store.get_or_create_conversation(self.session_id, session_key=self.session_id)
 
     def _summarize_chunk(self, messages: list[MessageRecord], *, focus_topic: str | None = None) -> str:
-        # Deterministic fallback summary: safe for clean installs with no API key.
-        lines = [SUMMARY_PREFIX, f"Source range: seq {messages[0].seq}–{messages[-1].seq}; messages: {len(messages)}."]
-        if focus_topic:
-            lines.append(f"Manual compression focus: {focus_topic}")
-        for m in messages[:40]:
-            text = m.content_text.replace("\n", " ")[:500]
-            lines.append(f"- seq {m.seq} {m.role}: {text}")
-        if len(messages) > 40:
-            lines.append(f"- … {len(messages)-40} additional messages preserved in source store; use lcm_expand for exact details.")
-        lines.append("Expand for details about: exact commands, tool outputs, file paths, error messages, and intermediate reasoning preserved in source messages.")
-        return "\n".join(lines)
+        return self.summarizer.summarize(messages, focus_topic=focus_topic)
+
+    def _maybe_create_parent_summary(self, conversation_id: int, *, focus_topic: str | None = None) -> None:
+        rows = self.store.conn.execute(
+            """SELECT * FROM summaries s
+               WHERE conversation_id=? AND depth < ?
+                 AND NOT EXISTS(SELECT 1 FROM summary_edges e WHERE e.child_summary_id=s.summary_id)
+               ORDER BY depth ASC, earliest_seq ASC, created_at ASC
+               LIMIT ?""",
+            (conversation_id, self.max_summary_depth, self.parent_summary_fanout),
+        ).fetchall()
+        if len(rows) < self.parent_summary_fanout:
+            return
+        children = [self.store.get_summary(r["summary_id"]) for r in rows]
+        ready = [c for c in children if c is not None]
+        if len(ready) < self.parent_summary_fanout:
+            return
+        child_messages = [
+            MessageRecord(0, conversation_id, c.earliest_seq or 0, "summary", None, c.content, c.token_count, c.created_at)
+            for c in ready
+        ]
+        content = self.summarizer.summarize(child_messages, focus_topic=focus_topic or "parent summary over child summaries")
+        self.store.create_parent_summary(conversation_id, ready, content, model=self.summarizer.model_name)
 
     def _assemble_messages(self, conversation_id: int, original: list[dict[str, Any]]) -> list[dict[str, Any]]:
         system = [m for m in original if m.get("role") == "system"]
         non_system = [m for m in original if m.get("role") != "system"]
-        head = non_system[: self.protect_first_n]
-        tail = non_system[-self.protect_last_n :] if self.protect_last_n else []
-        # Include newest summaries as reference material. These are assistant
-        # reference notes, not system/developer instructions, so historical
-        # content cannot silently become active policy.
-        rows = self.store.conn.execute("SELECT content FROM summaries WHERE conversation_id=? ORDER BY created_at DESC LIMIT 8", (conversation_id,)).fetchall()
-        summaries = []
-        for row in reversed(rows):
-            summaries.append({
-                "role": "assistant",
-                "content": SUMMARY_SYSTEM_GUARD + "\n\n<lossless_context_summary>\n" + row["content"] + "\n</lossless_context_summary>",
-            })
-        return [*system, *head, *summaries, *tail]
+        head_count = min(self.protect_first_n, len(non_system))
+        head = non_system[:head_count]
+        tail_start = max(head_count, len(non_system) - self.protect_last_n) if self.protect_last_n else len(non_system)
+        tail = non_system[tail_start:] if self.protect_last_n else []
+        protected_tokens = estimate_tokens([m.get("content") for m in [*system, *head, *tail]])
+        if self.threshold_tokens:
+            budget = max(int(self.threshold_tokens * 0.8), self.threshold_tokens - protected_tokens)
+        else:
+            budget = 0
+        rows = self.store.conn.execute(
+            """SELECT * FROM summaries WHERE conversation_id=?
+               AND NOT EXISTS(SELECT 1 FROM summary_edges e WHERE e.child_summary_id=summaries.summary_id)
+               ORDER BY depth DESC, created_at DESC""",
+            (conversation_id,),
+        ).fetchall()
+        selected: list[dict[str, Any]] = []
+        summary_tokens = 0
+        for row in rows:
+            content = row["content"]
+            wrapped = SUMMARY_SYSTEM_GUARD + "\n\n<lossless_context_summary id=\"" + row["summary_id"] + "\">\n" + content + "\n</lossless_context_summary>"
+            tokens = estimate_tokens(wrapped)
+            if budget <= 0:
+                continue
+            if summary_tokens + tokens > budget:
+                if selected:
+                    continue
+                # Keep one bounded reference summary when possible so compression
+                # remains useful, but never exceed the summary budget knowingly.
+                for allowed_chars in (400, 250, 150, 80, 40):
+                    truncated_content = content[:allowed_chars] + "\n…[summary truncated to fit assembly budget; use lcm_expand for exact source]"
+                    wrapped = SUMMARY_SYSTEM_GUARD + "\n\n<lossless_context_summary id=\"" + row["summary_id"] + "\">\n" + truncated_content + "\n</lossless_context_summary>"
+                    tokens = estimate_tokens(wrapped)
+                    if tokens <= budget:
+                        break
+                if tokens > budget:
+                    continue
+            selected.append({"role": "assistant", "content": wrapped})
+            summary_tokens += tokens
+        selected.reverse()
+        self.last_assembly = {
+            "protected_tokens": protected_tokens,
+            "summary_tokens": summary_tokens,
+            "summary_count": len(selected),
+            "budget_tokens": budget,
+        }
+        return [*system, *head, *selected, *tail]
