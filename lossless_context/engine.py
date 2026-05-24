@@ -145,7 +145,7 @@ class LosslessContextEngine(ContextEngine):
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         return [
-            {"name": "lcm_grep", "description": "Search lossless context messages and summaries.", "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}, "mode": {"type": "string", "enum": ["full_text", "like"]}, "scope": {"type": "string", "enum": ["messages", "summaries", "both"]}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, "required": ["pattern"]}},
+            {"name": "lcm_grep", "description": "Search lossless context messages and summaries.", "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}, "mode": {"type": "string", "enum": ["full_text", "like"]}, "scope": {"type": "string", "enum": ["messages", "summaries", "both"]}, "currentOnly": {"type": "boolean", "description": "Restrict search to the current conversation. Defaults to false so recall searches indexed history."}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, "required": ["pattern"]}},
             {"name": "lcm_describe", "description": "Describe a lossless context summary by id.", "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
             {"name": "lcm_expand", "description": "Expand a summary into its source messages.", "parameters": {"type": "object", "properties": {"id": {"type": "string"}, "maxMessages": {"type": "integer", "minimum": 1, "maximum": 100}}, "required": ["id"]}},
             {"name": "lcm_status", "description": "Return lossless context engine status and integrity report.", "parameters": {"type": "object", "properties": {}}},
@@ -159,7 +159,12 @@ class LosslessContextEngine(ContextEngine):
             self.store.ingest_messages(cid, messages)
         try:
             if name == "lcm_grep":
-                return json.dumps({"results": self.store.grep(str(args.get("pattern", "")), mode=str(args.get("mode", "full_text")), scope=str(args.get("scope", "both")), conversation_id=cid, limit=int(args.get("limit", 20)))}, ensure_ascii=False)
+                # Recall should search the whole lossless store by default. Restricting
+                # to the just-created/current conversation makes cross-session recall
+                # look empty even when historical messages are indexed. Keep an opt-in
+                # currentOnly escape hatch for focused debugging.
+                current_only = bool(args.get("currentOnly", False))
+                return json.dumps({"results": self.store.grep(str(args.get("pattern", "")), mode=str(args.get("mode", "full_text")), scope=str(args.get("scope", "both")), conversation_id=cid if current_only else None, limit=int(args.get("limit", 20)))}, ensure_ascii=False)
             if name == "lcm_describe":
                 sid = str(args.get("id", ""))
                 summary = self.store.get_summary(sid)

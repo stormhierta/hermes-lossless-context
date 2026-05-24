@@ -43,6 +43,20 @@ def test_grep_full_text_special_chars_do_not_crash(tmp_path):
     assert isinstance(store.grep("@foo:bar -baz", conversation_id=cid), list)
 
 
+def test_lcm_grep_searches_indexed_history_by_default(tmp_path):
+    engine = LosslessContextEngine(db_path=tmp_path / "lcm.db", context_length=200)
+    engine.on_session_start("historical-session")
+    engine.store.ingest_messages(engine.conversation_id or 0, [
+        {"role": "user", "content": "historic recall marker alpha"},
+    ])
+    engine.conversation_id = None
+    engine.on_session_start("current-session")
+    global_results = json.loads(engine.handle_tool_call("lcm_grep", {"pattern": "historic recall marker", "mode": "like"}))
+    assert global_results["results"]
+    current_results = json.loads(engine.handle_tool_call("lcm_grep", {"pattern": "historic recall marker", "mode": "like", "currentOnly": True}))
+    assert current_results["results"] == []
+
+
 def test_engine_compress_preserves_source_and_returns_valid_messages(tmp_path):
     engine = LosslessContextEngine(db_path=tmp_path / "lcm.db", context_length=200)
     engine.on_session_start("session-a")
