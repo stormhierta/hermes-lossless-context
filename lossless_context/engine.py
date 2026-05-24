@@ -15,7 +15,15 @@ except Exception:  # allows tests without Hermes installed
         threshold_percent = 0.75
         protect_first_n = 3
         protect_last_n = 6
-        def update_model(self, model: str, context_length: int, base_url: str = "", api_key: str = "", provider: str = "") -> None:
+        def update_model(
+            self,
+            model: str,
+            context_length: int,
+            base_url: str = "",
+            api_key: str = "",
+            provider: str = "",
+            api_mode: str = "",
+        ) -> None:
             self.context_length = context_length
             self.threshold_tokens = int(context_length * self.threshold_percent)
 
@@ -78,7 +86,15 @@ class LosslessContextEngine(ContextEngine):
         self.last_completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
         self.last_total_tokens = int(usage.get("total_tokens") or (self.last_prompt_tokens + self.last_completion_tokens))
 
-    def update_model(self, model: str, context_length: int, base_url: str = "", api_key: str = "", provider: str = "") -> None:
+    def update_model(
+        self,
+        model: str,
+        context_length: int,
+        base_url: str = "",
+        api_key: str = "",
+        provider: str = "",
+        api_mode: str = "",
+    ) -> None:
         self.context_length = int(context_length or self.context_length or 128000)
         self.threshold_tokens = int(self.context_length * self.threshold_percent)
 
