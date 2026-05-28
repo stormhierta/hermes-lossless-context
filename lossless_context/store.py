@@ -214,10 +214,22 @@ class LosslessStore:
         row = self.conn.execute("SELECT value FROM meta WHERE key='fts5'").fetchone()
         return bool(row and row[0] == "1")
 
-    def get_or_create_conversation(self, session_id: str, session_key: str | None = None, title: str | None = None) -> int:
+    def get_or_create_conversation(
+        self,
+        session_id: str,
+        session_key: str | None = None,
+        title: str | None = None,
+        conversation_id: int | None = None,
+    ) -> int:
         with self._write_lock:
             now = time.time()
             session_key = session_key or session_id or "default"
+            if conversation_id is not None:
+                row = self.conn.execute("SELECT id FROM conversations WHERE id=?", (conversation_id,)).fetchone()
+                if row:
+                    self.conn.execute("UPDATE conversations SET updated_at=?, title=COALESCE(?, title) WHERE id=?", (now, title, row[0]))
+                    self.conn.commit()
+                    return int(row[0])
             row = self.conn.execute("SELECT id FROM conversations WHERE session_id=?", (session_id,)).fetchone()
             if row:
                 self.conn.execute("UPDATE conversations SET updated_at=?, title=COALESCE(?, title) WHERE id=?", (now, title, row[0]))
@@ -229,6 +241,50 @@ class LosslessStore:
             )
             self.conn.commit()
             return int(cur.lastrowid)
+
+    def get_or_create_conversation_for_session_key(
+        self,
+        session_id: str,
+        session_key: str,
+        title: str | None = None,
+    ) -> int:
+        """Bind a host session to the stable logical conversation key."""
+        with self._write_lock:
+            now = time.time()
+            row = self.conn.execute(
+                "SELECT id FROM conversations WHERE session_key=? ORDER BY created_at ASC LIMIT 1",
+                (session_key,),
+            ).fetchone()
+            if row:
+                self.conn.execute("UPDATE conversations SET updated_at=?, title=COALESCE(?, title) WHERE id=?", (now, title, row[0]))
+                self.conn.commit()
+                return int(row[0])
+            return self.get_or_create_conversation(session_id, session_key=session_key, title=title)
+
+    def conversation_id_for_session(self, session_id: str) -> int | None:
+        row = self.conn.execute("SELECT id FROM conversations WHERE session_id=?", (session_id,)).fetchone()
+        return int(row[0]) if row else None
+
+    def messages_for_conversation(self, conversation_id: int, *, limit: int | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT role, content_json, source_type, source_identifier FROM messages WHERE conversation_id=? ORDER BY seq ASC"
+        params: tuple[Any, ...] = (conversation_id,)
+        if limit is not None and limit > 0:
+            sql += " LIMIT ?"
+            params = (conversation_id, int(limit))
+        rows = self.conn.execute(sql, params).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                content = json.loads(row["content_json"]) if row["content_json"] is not None else None
+            except Exception:
+                content = None
+            msg: dict[str, Any] = {"role": row["role"], "content": content}
+            if row["source_type"]:
+                msg["source_type"] = row["source_type"]
+            if row["source_identifier"]:
+                msg["source_identifier"] = row["source_identifier"]
+            out.append(msg)
+        return out
 
     def ingest_messages(self, conversation_id: int, messages: list[dict[str, Any]]) -> int:
         """Idempotently ingest OpenAI-format messages. Returns inserted count.

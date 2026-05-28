@@ -76,6 +76,7 @@ class LosslessContextEngine(ContextEngine):
         self.max_summary_depth = int(os.getenv("HERMES_LCM_MAX_SUMMARY_DEPTH", "2"))
         self.summarizer = summarizer or DeterministicSummarizer(max_messages=int(os.getenv("HERMES_LCM_SUMMARY_MAX_MESSAGES", "40")))
         self.last_assembly: dict[str, Any] = {}
+        self.carry_over_message_limit = int(os.getenv("HERMES_LCM_CARRY_OVER_MESSAGES", "200"))
 
     @property
     def name(self) -> str:
@@ -100,7 +101,29 @@ class LosslessContextEngine(ContextEngine):
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
         self.session_id = session_id or "default"
-        self.conversation_id = self.store.get_or_create_conversation(self.session_id, session_key=self.session_id, title=kwargs.get("title"))
+        raw_conversation_id = kwargs.get("conversation_id")
+        conversation_id: int | None = None
+        session_key = str(raw_conversation_id or self.session_id)
+        if isinstance(raw_conversation_id, int):
+            conversation_id = raw_conversation_id
+        elif isinstance(raw_conversation_id, str) and raw_conversation_id.isdigit():
+            conversation_id = int(raw_conversation_id)
+        if conversation_id is not None:
+            self.conversation_id = self.store.get_or_create_conversation(
+                self.session_id,
+                session_key=session_key,
+                title=kwargs.get("title"),
+                conversation_id=conversation_id,
+            )
+        else:
+            self.conversation_id = self.store.get_or_create_conversation_for_session_key(
+                self.session_id,
+                session_key=session_key,
+                title=kwargs.get("title"),
+            )
+        old_session_id = kwargs.get("old_session_id")
+        if kwargs.get("boundary_reason") == "compression" and old_session_id:
+            self.carry_over_new_session_context(str(old_session_id), self.session_id)
 
     def on_session_end(self, session_id: str, messages: list[dict[str, Any]]) -> None:
         self._ensure_conversation(session_id)
@@ -119,6 +142,18 @@ class LosslessContextEngine(ContextEngine):
     def on_session_reset(self) -> None:
         self.last_prompt_tokens = self.last_completion_tokens = self.last_total_tokens = 0
         self.compression_count = 0
+
+    def carry_over_new_session_context(self, old_session_id: str, new_session_id: str) -> None:
+        """Copy recent indexed source messages across a host session rollover."""
+        old_cid = self.store.conversation_id_for_session(old_session_id)
+        if old_cid is None:
+            return
+        new_cid = self.store.get_or_create_conversation(new_session_id, session_key=new_session_id)
+        messages = self.store.messages_for_conversation(old_cid, limit=self.carry_over_message_limit)
+        if messages:
+            self.store.ingest_messages(new_cid, messages)
+        self.conversation_id = new_cid
+        self.session_id = new_session_id
 
     def should_compress(self, prompt_tokens: int | None = None) -> bool:
         tokens = int(prompt_tokens or self.last_prompt_tokens or 0)
@@ -218,10 +253,10 @@ class LosslessContextEngine(ContextEngine):
         content = self.summarizer.summarize(child_messages, focus_topic=focus_topic or "parent summary over child summaries")
         self.store.create_parent_summary(conversation_id, ready, content, model=self.summarizer.model_name)
 
-    def _assemble_messages(self, conversation_id: int, original: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _assemble_messages(self, conversation_id: int, original: list[dict[str, Any]], *, bypass_protect_head: bool = False) -> list[dict[str, Any]]:
         system = [m for m in original if m.get("role") == "system"]
         non_system = [m for m in original if m.get("role") != "system"]
-        head_count = min(self.protect_first_n, len(non_system))
+        head_count = 0 if bypass_protect_head else min(self.protect_first_n, len(non_system))
         head = non_system[:head_count]
         tail_start = max(head_count, len(non_system) - self.protect_last_n) if self.protect_last_n else len(non_system)
         tail = non_system[tail_start:] if self.protect_last_n else []

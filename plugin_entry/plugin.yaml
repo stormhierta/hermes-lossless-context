@@ -1,5 +1,5 @@
 name: lossless_context
-version: 0.1.4
+version: 0.1.5
 description: Source-preserving Lossless Context engine and recall tools for Hermes Agent
 kind: standalone
 module: lossless_context

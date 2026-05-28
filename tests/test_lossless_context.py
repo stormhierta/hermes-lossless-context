@@ -346,6 +346,74 @@ def test_store_replay_is_idempotent(tmp_path):
     assert [r["seq"] for r in rows] == [1, 2]
 
 
+def test_on_session_start_reuses_stable_string_gateway_session_key(tmp_path):
+    engine = LosslessContextEngine(db_path=tmp_path / "lcm.db")
+    gateway_key = "agent:main:telegram:dm:12345"
+    engine.on_session_start("host-session-1", conversation_id=gateway_key)
+    cid = engine.conversation_id or 0
+    engine.store.ingest_messages(cid, [{"role": "user", "content": "gateway-key indexed"}])
+
+    engine.on_session_start("host-session-2", conversation_id=gateway_key)
+
+    assert engine.conversation_id == cid
+    rows = engine.store.conn.execute("SELECT COUNT(*) AS c FROM conversations WHERE session_key=?", (gateway_key,)).fetchone()
+    assert rows["c"] == 1
+    messages = engine.store.conn.execute("SELECT content_text FROM messages WHERE conversation_id=?", (cid,)).fetchall()
+    assert [r["content_text"] for r in messages] == ["gateway-key indexed"]
+
+
+def test_on_session_start_honors_existing_numeric_conversation_id(tmp_path):
+    engine = LosslessContextEngine(db_path=tmp_path / "lcm.db")
+    cid = engine.store.get_or_create_conversation("stable-session-key")
+    engine.store.ingest_messages(cid, [{"role": "user", "content": "already indexed"}])
+
+    engine.on_session_start("new-host-session", conversation_id=cid)
+
+    assert engine.conversation_id == cid
+    rows = engine.store.conn.execute("SELECT content_text FROM messages WHERE conversation_id=?", (cid,)).fetchall()
+    assert [r["content_text"] for r in rows] == ["already indexed"]
+
+
+def test_compression_boundary_carries_old_messages_to_new_session(tmp_path):
+    engine = LosslessContextEngine(db_path=tmp_path / "lcm.db")
+    engine.on_session_start("old-session")
+    old_cid = engine.conversation_id or 0
+    engine.store.ingest_messages(old_cid, [
+        {"role": "user", "content": "old task source"},
+        {"role": "assistant", "content": "old task answer"},
+    ])
+
+    engine.on_session_start("new-session", boundary_reason="compression", old_session_id="old-session")
+
+    new_cid = engine.conversation_id or 0
+    assert new_cid != old_cid
+    rows = engine.store.conn.execute("SELECT content_text FROM messages WHERE conversation_id=? ORDER BY seq", (new_cid,)).fetchall()
+    assert [r["content_text"] for r in rows] == ["old task source", "old task answer"]
+
+
+def test_assemble_can_bypass_protected_head_to_avoid_stale_task(tmp_path):
+    engine = LosslessContextEngine(db_path=tmp_path / "lcm.db")
+    engine.protect_first_n = 2
+    engine.protect_last_n = 1
+    cid = engine.store.get_or_create_conversation("bypass-head")
+    engine.store.ingest_messages(cid, [{"role": "user", "content": "summarized history"}])
+    chunk = engine.store.unsummarized_messages(cid, protect_last_n=0, limit_tokens=1000)
+    engine.store.create_leaf_summary(cid, chunk, "summary of older work")
+    original = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "STALE TASK A"},
+        {"role": "assistant", "content": "stale answer"},
+        {"role": "user", "content": "CURRENT TASK B"},
+    ]
+
+    out = engine._assemble_messages(cid, original, bypass_protect_head=True)
+
+    joined = "\n".join(str(m.get("content", "")) for m in out)
+    assert "STALE TASK A" not in joined
+    assert "summary of older work" in joined
+    assert "CURRENT TASK B" in joined
+
+
 def test_schema_migration_v2_adds_metadata_and_removes_identity_uniqueness(tmp_path):
     import sqlite3, time
     db = tmp_path / "old.db"
